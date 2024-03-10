@@ -171,6 +171,9 @@ static inline bool i2c_ll_slave_addressed(i2c_dev_t *hw)
 #endif
 }
 
+// When in slave mode
+//  true:   master reads from slave
+//  false:  master writes to slave.
 static inline bool i2c_ll_slave_rw(i2c_dev_t *hw)//not exposed by hal_ll
 {
 #if CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32S3
@@ -646,6 +649,7 @@ static bool i2c_slave_handle_tx_fifo_empty(i2c_slave_struct_t * i2c)
     return pxHigherPriorityTaskWoken;
 }
 
+// use also for reading rx hardware fifo not only full
 static bool i2c_slave_handle_rx_fifo_full(i2c_slave_struct_t * i2c, uint32_t len)
 {
 #if I2C_SLAVE_USE_RX_QUEUE
