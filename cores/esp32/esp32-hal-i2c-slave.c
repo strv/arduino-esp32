@@ -338,10 +338,13 @@ esp_err_t i2cSlaveInit(uint8_t num, int sda, int scl, uint16_t slaveID, uint32_t
             goto fail;
         }
     }
-    
+
     i2c_ll_txfifo_rst(i2c->dev);
     i2c_ll_rxfifo_rst(i2c->dev);
     i2c_ll_slave_enable_rx_it(i2c->dev);
+#ifndef CONFIG_IDF_TARGET_ESP32
+    i2c_ll_enable_intr_mask(i2c->dev, I2C_DET_START_INT_ENA);
+#endif
     i2c_ll_set_stretch(i2c->dev, 0x3FF);
     i2c_ll_update(i2c->dev);
     I2C_SLAVE_MUTEX_UNLOCK();
@@ -683,24 +686,45 @@ static void i2c_slave_isr_handler(void* arg)
     uint32_t activeInt = i2c_ll_get_intsts_mask(i2c->dev);
     i2c_ll_clr_intsts_mask(i2c->dev, activeInt);
     uint8_t rx_fifo_len = i2c_ll_get_rxfifo_cnt(i2c->dev);
-    bool slave_rw = i2c_ll_slave_rw(i2c->dev);
+    bool slave_rw = i2c_ll_slave_rw(i2c->dev); // ture : master read from slave
 
     if(activeInt & I2C_RXFIFO_WM_INT_ENA){ // RX FiFo Full
         pxHigherPriorityTaskWoken |= i2c_slave_handle_rx_fifo_full(i2c, rx_fifo_len);
         i2c_ll_slave_enable_rx_it(i2c->dev);//is this necessary?
     }
 
-    if(activeInt & I2C_TRANS_COMPLETE_INT_ENA){ // STOP
-        if(rx_fifo_len){ //READ RX FIFO
+#ifndef CONFIG_IDF_TARGET_ESP32
+    if(activeInt & I2C_DET_START_INT_ENA){  // detect START condition
+        if(rx_fifo_len){ // Move data from hardware fifo to ring beffer
             pxHigherPriorityTaskWoken |= i2c_slave_handle_rx_fifo_full(i2c, rx_fifo_len);
         }
-        if(i2c->rx_data_count){ //WRITE or RepeatedStart
-            //SEND RX Event
+        if(i2c->rx_data_count){
+            // receieved some with START = restarted
+            // Process received data
+            // log_i("RESTART %d %08X %d", slave_rw, activeInt, rx_fifo_len);
             i2c_slave_queue_event_t event;
             event.event = I2C_SLAVE_EVT_RX;
-            event.stop = !slave_rw;
+            event.stop = false;
             event.param = i2c->rx_data_count;
-            pxHigherPriorityTaskWoken |= i2c_slave_send_event(i2c, &event);
+            pxHigherPriorityTaskWoken |= i2c_slave_send_event(i2c, &event); // create RX event
+            //Zero RX count
+            i2c->rx_data_count = 0;
+        }
+    }
+#endif
+
+    if(activeInt & I2C_TRANS_COMPLETE_INT_ENA){ // detect STOP condition
+        //log_i("STOP %d %02X %d", slave_rw, activeInt, rx_fifo_len);
+        if(rx_fifo_len){ // Move data from hardware fifo to ring beffer
+            pxHigherPriorityTaskWoken |= i2c_slave_handle_rx_fifo_full(i2c, rx_fifo_len);
+        }
+        if(i2c->rx_data_count){ // If the hardware fifo is not empty with STOP sequence
+            //log_i("STOP %d %08X %d", slave_rw, activeInt, rx_fifo_len);
+            i2c_slave_queue_event_t event;
+            event.event = I2C_SLAVE_EVT_RX;
+            event.stop = true;
+            event.param = i2c->rx_data_count;
+            pxHigherPriorityTaskWoken |= i2c_slave_send_event(i2c, &event); // create RX event
             //Zero RX count
             i2c->rx_data_count = 0;
         }
@@ -774,9 +798,9 @@ static size_t i2c_slave_read_rx(i2c_slave_struct_t * i2c, uint8_t * data, size_t
     }
     return (data)?len:0;
 #else
-    size_t  dlen = 0, 
-            to_read = len, 
-            so_far = 0, 
+    size_t  dlen = 0,
+            to_read = len,
+            so_far = 0,
             available = 0;
     uint8_t * rx_data = NULL;
 
@@ -813,7 +837,7 @@ static void i2c_slave_task(void *pv_args)
     uint8_t * data = NULL;
     for(;;){
         if(xQueueReceive(i2c->event_queue, &event, portMAX_DELAY) == pdTRUE){
-            // Write
+            // Master Write to slave
             if(event.event == I2C_SLAVE_EVT_RX){
                 len = event.param;
                 stop = event.stop;
@@ -828,7 +852,7 @@ static void i2c_slave_task(void *pv_args)
                 }
                 free(data);
 
-            // Read
+            // Master Read from slave
             } else if(event.event == I2C_SLAVE_EVT_TX){
                 if(i2c->request_callback){
                     i2c->request_callback(i2c->num, i2c->arg);
